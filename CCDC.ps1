@@ -993,7 +993,55 @@ function Generate-WDAC {
 }
 
 function Refresh-WDAC {
-    Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"}
+    param(
+        [string]$PolicyXml = "$env:USERPROFILE\Desktop\Policy.xml"
+    )
+
+    if (-not (Test-Path $PolicyXml)) {
+        Write-Host "[!] Policy XML not found at $PolicyXml" -ForegroundColor Red
+        return
+    }
+
+    # Extract PolicyID from XML to name the .cip file correctly (multi-policy format)
+    [xml]$xml = Get-Content $PolicyXml
+    $policyId = $xml.SiPolicy.PolicyID
+    if (-not $policyId) {
+        Write-Host "[!] Could not read PolicyID from $PolicyXml" -ForegroundColor Red
+        return
+    }
+    Write-Host "[+] PolicyID: $policyId" -ForegroundColor Cyan
+
+    $activeDir = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
+    $cipPath   = Join-Path $activeDir "$policyId.cip"
+
+    if (-not (Test-Path $activeDir)) {
+        New-Item -ItemType Directory -Path $activeDir -Force | Out-Null
+    }
+
+    Write-Host "[+] Converting $PolicyXml -> $cipPath" -ForegroundColor Cyan
+    ConvertFrom-CIPolicy -XmlFilePath $PolicyXml -BinaryFilePath $cipPath | Out-Null
+
+    $citool = "$env:windir\System32\citool.exe"
+    if (-not (Test-Path $citool)) {
+        Write-Host "[!] citool.exe not found - falling back to CimMethod" -ForegroundColor Yellow
+        Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = $cipPath}
+        return
+    }
+
+    Write-Host "[+] Deploying policy..." -ForegroundColor Cyan
+    & $citool --update-policy $cipPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[!] citool --update-policy exited with code $LASTEXITCODE" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "[+] Refreshing policies..." -ForegroundColor Cyan
+    & $citool --refresh-policy
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[+] Policy refreshed successfully" -ForegroundColor Green
+    } else {
+        Write-Host "[!] citool --refresh-policy exited with code $LASTEXITCODE" -ForegroundColor Red
+    }
 }
 
 function Get-GroupMembersRecursive {
