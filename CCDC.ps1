@@ -1036,11 +1036,11 @@ function Refresh-WDAC {
     }
 
     Write-Host "[+] Refreshing policies..." -ForegroundColor Cyan
-    & $citool --refresh-policy
+    & $citool --refresh
     if ($LASTEXITCODE -eq 0) {
         Write-Host "[+] Policy refreshed successfully" -ForegroundColor Green
     } else {
-        Write-Host "[!] citool --refresh-policy exited with code $LASTEXITCODE" -ForegroundColor Red
+        Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
     }
 }
 
