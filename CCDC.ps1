@@ -937,6 +937,46 @@ function Generate-WDAC {
     ConvertFrom-CIPolicy -XmlFilePath $Policy -BinaryFilePath $PolicyBin > $null
     Write-Host "[+] Generated policy at $PolicyBin"
 
+    # =========================================================
+    # DC-only: Configure WDAC block notification message via GPO
+    # =========================================================
+    $domainRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
+    # DomainRole: 4 = Backup Domain Controller, 5 = Primary Domain Controller
+    $isDC = $domainRole -eq 4 -or $domainRole -eq 5
+
+    if ($isDC) {
+        Write-Host "`n[+] Domain Controller detected - configuring WDAC block message in Default Domain Policy..." -ForegroundColor Cyan
+
+        $defaultMessage = "This application has been blocked by your organization's security policy. Contact your IT administrator for assistance."
+        Write-Host "[?] Enter custom WDAC block notification message (leave blank for default):" -ForegroundColor Yellow
+        Write-Host "    Default: $defaultMessage" -ForegroundColor DarkGray
+        $customMessage = Read-Host -Prompt "    Message"
+        if ([string]::IsNullOrWhiteSpace($customMessage)) {
+            $customMessage = $defaultMessage
+        }
+
+        try {
+            Import-Module GroupPolicy -ErrorAction Stop
+
+            # Verify Default Domain Policy exists before modifying
+            Get-GPO -Name "Default Domain Policy" -ErrorAction Stop | Out-Null
+
+            Set-GPRegistryValue -Name "Default Domain Policy" `
+                -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\SRPV2" `
+                -ValueName "BlockingMessage" `
+                -Type String `
+                -Value $customMessage | Out-Null
+
+            Write-Host "[+] WDAC block message set in Default Domain Policy" -ForegroundColor Green
+            Write-Host "[!] Run 'gpupdate /force' on domain members to apply the updated message" -ForegroundColor Yellow
+        } catch {
+            Write-Host "[!] Failed to configure WDAC block message in GPO: $_" -ForegroundColor Red
+            Write-Host "[!] Ensure the GroupPolicy module is available and you have Domain Admin rights" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[~] Not a domain controller - skipping WDAC GPO block message configuration" -ForegroundColor DarkGray
+    }
+
     if ($Refresh) {
         Write-Host "[+] Refreshing policy..."
         try {
