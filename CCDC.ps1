@@ -646,10 +646,15 @@ function Enumerate {
                                 @{Name="AccessRight";Expression={$_.AccessRight}},
                                 @{Name="AccountName";Expression={$_.AccountName}}
     } | Out-Host
-    Read-Host -Prompt "Press enter to remove and limit unnecessary shares!"
-    net share C$ /delete
-    net share ADMIN$ /delete
-    Read-Host -Prompt "Stop HERE! Change permissions on shares to readonly in the gui! If done, press enter!"
+    $removeShares = Read-Host -Prompt "Remove unnecessary admin shares (C$, ADMIN$)? (yes/no)"
+    if ($removeShares -eq "yes") {
+        net share C$ /delete
+        net share ADMIN$ /delete
+        Write-Host "[+] Admin shares removed" -ForegroundColor Green
+        Read-Host -Prompt "Change permissions on remaining shares to readonly in the GUI, then press ENTER"
+    } else {
+        Write-Host "[*] Skipping share removal" -ForegroundColor Yellow
+    }
 
     Clear-History
     try {
@@ -699,16 +704,29 @@ function Guest-Service {
 
 function Phase2 {
     Write-Output "Starting Phase 2!"
-    Read-Host -Prompt "Stopping services: WebClient, Spooler, WinRM"
-    Get-Service "WebClient" -ErrorAction SilentlyContinue | Stop-Service -ErrorAction SilentlyContinue
-    Get-Service "Spooler" | Stop-Service
-    Get-Service "WinRM" | Stop-Service
-    Read-Host -Prompt "Press enter to start Defender services"
-    Get-Service "WinDefend" | Start-Service # Microsoft Defender Antivirus Service - MsMpEng.exe
-    Get-Service "WdNisSvc" | Start-Service # Microsoft Defender Antivirus Network Inspection Service - NisSrv.exe
-    Get-Service "MdCoreSvc" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Microsoft Defender Core Service - may not be present
-    Get-Service "SecurityHealthService" | Start-Service # Windows Security Service - SecurityHealthService.exe
-    Get-Service "Sense" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Windows Defender ATP - requires MDE
+
+    $stopSvcs = Read-Host -Prompt "Stop services: WebClient, Spooler, WinRM? (yes/no)"
+    if ($stopSvcs -eq "yes") {
+        Get-Service "WebClient" -ErrorAction SilentlyContinue | Stop-Service -ErrorAction SilentlyContinue
+        Get-Service "Spooler" | Stop-Service
+        Get-Service "WinRM" | Stop-Service
+        Write-Host "[+] Services stopped" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Skipping service shutdown" -ForegroundColor Yellow
+    }
+
+    $startDefender = Read-Host -Prompt "Start Defender services? (yes/no)"
+    if ($startDefender -eq "yes") {
+        Get-Service "WinDefend" | Start-Service # Microsoft Defender Antivirus Service - MsMpEng.exe
+        Get-Service "WdNisSvc" | Start-Service # Microsoft Defender Antivirus Network Inspection Service - NisSrv.exe
+        Get-Service "MdCoreSvc" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Microsoft Defender Core Service - may not be present
+        Get-Service "SecurityHealthService" | Start-Service # Windows Security Service - SecurityHealthService.exe
+        Get-Service "Sense" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Windows Defender ATP - requires MDE
+        Write-Host "[+] Defender services started" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Skipping Defender services" -ForegroundColor Yellow
+    }
+
     Write-Output "Current Exclusions: (Path = Folder & File, Extension = File type, Process = Process Binary)"
     $mpPref = Get-MpPreference
     Write-Host "  ExclusionPath:" -ForegroundColor Cyan
@@ -717,7 +735,7 @@ function Phase2 {
     $mpPref.ExclusionProcess | ForEach-Object { Write-Host "    $_" }
     Write-Host "  ExclusionExtension:" -ForegroundColor Cyan
     $mpPref.ExclusionExtension | ForEach-Object { Write-Host "    $_" }
-    $answer = Read-Host -Prompt "Do you want to remove exclusions? yes/no"
+    $answer = Read-Host -Prompt "Do you want to remove exclusions? (yes/no)"
     if ($answer -eq "yes")
     {
         foreach ($i in (Get-MpPreference).ExclusionPath) {
@@ -732,9 +750,12 @@ function Phase2 {
             Remove-MpPreference -ExclusionExtension $i
             Write-Host($i)
         }
+    } else {
+        Write-Host "[*] Skipping exclusion removal" -ForegroundColor Yellow
     }
-    
-    Read-Host -Prompt "Press enter to harden Defender (SampleSubmission, Enable protections, run Defender protection threats update)"
+
+    $hardenDefender = Read-Host -Prompt "Harden Defender (SampleSubmission, protections, signature update)? (yes/no)"
+    if ($hardenDefender -eq "yes") {
     Set-MpPreference -SubmitSamplesConsent SendAllSamples
     Set-MpPreference -MAPSReporting Advanced
     Set-MpPreference -DisableIOAVProtection 0
@@ -748,7 +769,12 @@ function Phase2 {
     Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Users\Public\"
     Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Windows\System32\CodeIntegrity\"
 
-    Read-Host -Prompt "Press enter to add ASR rules & restart Defender"
+    } else {
+        Write-Host "[*] Skipping Defender hardening" -ForegroundColor Yellow
+    }
+
+    $addASR = Read-Host -Prompt "Add ASR rules? (yes/no)"
+    if ($addASR -eq "yes") {
     Add-MpPreference -AttackSurfaceReductionRules_Ids 56a863a9-875e-4185-98a7-b882c64b5ce5 -AttackSurfaceReductionRules_Actions Enabled # Block abuse of exploited vulnerable signed drivers
     Add-MpPreference -AttackSurfaceReductionRules_Ids 7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c -AttackSurfaceReductionRules_Actions Enabled # Block Adobe Reader from creating child processes
     Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A -AttackSurfaceReductionRules_Actions Enabled # Block all Office applications from creating child processes
@@ -770,10 +796,18 @@ function Phase2 {
     Add-MpPreference -AttackSurfaceReductionRules_Ids C1DB55AB-C21A-4637-BB3F-A12568109D35 -AttackSurfaceReductionRules_Actions Enabled # Use advanced protection against ransomware
     #Restart-Service WinDefend # YOU CANNOT RESTART WINDEFEND. REBOOT HERE IS REQUIRED
     Update-MpSignature -AsJob
+    } else {
+        Write-Host "[*] Skipping ASR rules" -ForegroundColor Yellow
+    }
 
-    Read-Host -Prompt "Press enter to enable LSA protections"
-    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 1 -PropertyType DWord -Force
-    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 1 -PropertyType DWord -Force
+    $enableLSA = Read-Host -Prompt "Enable LSA protections (RunAsPPL)? (yes/no)"
+    if ($enableLSA -eq "yes") {
+        New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 1 -PropertyType DWord -Force
+        New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 1 -PropertyType DWord -Force
+        Write-Host "[+] LSA protections enabled" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Skipping LSA protections" -ForegroundColor Yellow
+    }
 
     Write-Host "[!] Finished Phase2!!`n" -ForegroundColor Green
     Write-Host "Things to do:`n* Run 'svcstuff'`n* Begin firewall rules!" -ForegroundColor Yellow
@@ -1069,6 +1103,160 @@ Function Add-UsersToGroup {
     }
 }
 
+function Apply-SecurityBaseline {
+    # Requires the GroupPolicy module (available on DCs and RSAT-installed machines)
+    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
+    $isDC = $domainRole -ge 4
+
+    if (-not $isDC) {
+        Write-Host "[!] This machine is not a Domain Controller (DomainRole=$domainRole)" -ForegroundColor Red
+        Write-Host "[!] Security Baseline GPO import requires a DC. Exiting." -ForegroundColor Red
+        return
+    }
+
+    Import-Module GroupPolicy -ErrorAction Stop
+
+    # --- Download Microsoft Security Compliance Toolkit LGPO.exe ---
+    $toolsDir = "C:\Tools"
+    $lgpo = Join-Path $toolsDir "LGPO.exe"
+    if (-not (Test-Path $toolsDir)) { New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null }
+
+    if (-not (Test-Path $lgpo)) {
+        Write-Host "[+] LGPO.exe not found - you will need it from the Microsoft Security Compliance Toolkit" -ForegroundColor Yellow
+        Write-Host "    Download from: https://www.microsoft.com/en-us/download/details.aspx?id=55319" -ForegroundColor Yellow
+        Write-Host "    Place LGPO.exe in C:\Tools\ and re-run this function" -ForegroundColor Yellow
+    } else {
+        Write-Host "[+] LGPO.exe found at $lgpo" -ForegroundColor Green
+    }
+
+    # --- Download and extract the Windows Security Baseline ---
+    $baselineDir = Join-Path $toolsDir "SecurityBaseline"
+    if (-not (Test-Path $baselineDir)) {
+        Write-Host "[+] Downloading Microsoft Windows Security Baseline..." -ForegroundColor Cyan
+        $baselineZip = Join-Path $toolsDir "SecurityBaseline.zip"
+        # Windows Server 2022 Security Baseline - update URL as needed for your target OS
+        $baselineUrl = "https://download.microsoft.com/download/8/5/C/85C25433-A1B0-4FFA-9429-7E023BBE2AE9/Windows%20Server%202022%20Security%20Baseline.zip"
+        try {
+            Invoke-WebRequest -Uri $baselineUrl -OutFile $baselineZip -UseBasicParsing
+            Expand-Archive -Path $baselineZip -DestinationPath $baselineDir -Force
+            Remove-Item $baselineZip -Force
+            Write-Host "[+] Security Baseline extracted to $baselineDir" -ForegroundColor Green
+        } catch {
+            Write-Host "[!] Failed to download baseline: $_" -ForegroundColor Red
+            Write-Host "[!] Download manually from https://www.microsoft.com/en-us/download/details.aspx?id=55319" -ForegroundColor Yellow
+            Write-Host "[!] Extract to $baselineDir and re-run" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[+] Security Baseline already present at $baselineDir" -ForegroundColor Green
+    }
+
+    # --- Find GPO backup folders in the baseline ---
+    $gpoBackups = Get-ChildItem -Path $baselineDir -Recurse -Directory | Where-Object {
+        Test-Path (Join-Path $_.FullName "backup.xml") -or
+        Test-Path (Join-Path $_.FullName "bkupInfo.xml")
+    }
+
+    if ($gpoBackups.Count -eq 0) {
+        Write-Host "[!] No GPO backups found in $baselineDir" -ForegroundColor Red
+        Write-Host "[!] Check that the baseline was extracted correctly" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "`n[+] Found $($gpoBackups.Count) GPO backup(s) in the security baseline:" -ForegroundColor Cyan
+    foreach ($gpo in $gpoBackups) {
+        $infoFile = Join-Path $gpo.FullName "bkupInfo.xml"
+        if (-not (Test-Path $infoFile)) { $infoFile = Join-Path $gpo.FullName "backup.xml" }
+        if (Test-Path $infoFile) {
+            [xml]$info = Get-Content $infoFile
+            $gpoName = $info.BackupInst.GPODisplayName.'#cdata-section'
+            if (-not $gpoName) { $gpoName = $gpo.Name }
+            Write-Host "    - $gpoName ($($gpo.Name))" -ForegroundColor DarkCyan
+        }
+    }
+
+    # --- Import baselines into the Default Domain Policy ---
+    $ddpName = "Default Domain Policy"
+    $ddp = Get-GPO -Name $ddpName -ErrorAction SilentlyContinue
+    if (-not $ddp) {
+        Write-Host "[!] Could not find '$ddpName' - is this a domain controller?" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`n[+] Importing security baseline settings into '$ddpName'..." -ForegroundColor Cyan
+    $backupLocation = ($gpoBackups[0].FullName | Split-Path -Parent)
+
+    foreach ($gpo in $gpoBackups) {
+        $gpoGuid = $gpo.Name
+        try {
+            Import-GPO -BackupId $gpoGuid -Path $backupLocation -TargetName $ddpName -CreateIfNeeded -ErrorAction Stop
+            Write-Host "    [+] Imported $gpoGuid" -ForegroundColor Green
+        } catch {
+            Write-Host "    [!] Failed to import $gpoGuid : $_" -ForegroundColor Red
+        }
+    }
+
+    # ============================================================
+    # Optional: Disable Defender (for testing environments)
+    # ============================================================
+    $disableDefender = Read-Host -Prompt "Disable Windows Defender via GPO? This is for TESTING environments only! (yes/no)"
+    if ($disableDefender -eq "yes") {
+        Write-Host "[!] Disabling Windows Defender via Default Domain Policy..." -ForegroundColor Yellow
+        $defenderKey = "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender"
+        Set-GPRegistryValue -Name $ddpName -Key $defenderKey -ValueName "DisableAntiSpyware" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $ddpName -Key "$defenderKey\Real-Time Protection" -ValueName "DisableRealtimeMonitoring" -Type DWord -Value 1
+        Write-Host "[+] Defender disabled via GPO (requires gpupdate on clients)" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Keeping Defender enabled via GPO" -ForegroundColor Yellow
+    }
+
+    # ============================================================
+    # Optional: Allow LDAP anonymous bind (for score check compat)
+    # ============================================================
+    $allowAnonLDAP = Read-Host -Prompt "Allow LDAP anonymous bind? Score checks often need this. (yes/no)"
+    if ($allowAnonLDAP -eq "yes") {
+        Write-Host "[+] Enabling LDAP anonymous bind via Default Domain Policy..." -ForegroundColor Cyan
+
+        # Registry: Allow anonymous LDAP queries (dsHeuristics approach via GPO registry)
+        $ldapKey = "HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Parameters"
+        Set-GPRegistryValue -Name $ddpName -Key $ldapKey -ValueName "LDAPServerIntegrity" -Type DWord -Value 0
+
+        # Also set the NTLM SSP key to allow anonymous
+        $lsaKey = "HKLM\SYSTEM\CurrentControlSet\Control\Lsa"
+        Set-GPRegistryValue -Name $ddpName -Key $lsaKey -ValueName "RestrictAnonymous" -Type DWord -Value 0
+        Set-GPRegistryValue -Name $ddpName -Key $lsaKey -ValueName "RestrictAnonymousSAM" -Type DWord -Value 0
+        Set-GPRegistryValue -Name $ddpName -Key $lsaKey -ValueName "EveryoneIncludesAnonymous" -Type DWord -Value 1
+
+        # Allow anonymous access to the Active Directory via dsHeuristics
+        try {
+            $configDN = (Get-ADRootDSE).configurationNamingContext
+            $dsDN = "CN=Directory Service,CN=Windows NT,CN=Services,$configDN"
+            $current = (Get-ADObject $dsDN -Properties dsHeuristics).dsHeuristics
+            if ([string]::IsNullOrEmpty($current) -or $current.Length -lt 7) {
+                $new = $current.PadRight(7, '0')
+                $new = $new.Substring(0,6) + '2' + $new.Substring(7)
+            } else {
+                $new = $current.Substring(0,6) + '2' + $current.Substring(7)
+            }
+            Set-ADObject $dsDN -Replace @{dsHeuristics = $new}
+            Write-Host "[+] dsHeuristics set to allow anonymous LDAP (position 7 = 2)" -ForegroundColor Green
+        } catch {
+            Write-Host "[!] Failed to update dsHeuristics: $_" -ForegroundColor Red
+            Write-Host "[!] You may need to manually set dsHeuristics 7th char to '2'" -ForegroundColor Yellow
+        }
+
+        Write-Host "[+] LDAP anonymous bind enabled" -ForegroundColor Green
+    } else {
+        Write-Host "[*] LDAP anonymous bind left at default (restricted)" -ForegroundColor Yellow
+    }
+
+    # Force a gpupdate
+    Write-Host "`n[+] Running gpupdate /force..." -ForegroundColor Cyan
+    gpupdate /force
+
+    Write-Host "[+] Security Baseline applied to '$ddpName'" -ForegroundColor Green
+    Write-Host "[!] Clients will pick up changes at next gpupdate interval or reboot" -ForegroundColor Yellow
+}
+
 function win-ccdc {
     $desktopPath = [Environment]::GetFolderPath('Desktop')
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -1153,6 +1341,21 @@ function win-ccdc {
         }
     } else {
         Write-Host "`n[*] Not a Domain Controller (DomainRole=$domainRole) - skipping DC-only tasks" -ForegroundColor Yellow
+    }
+
+    # ========================
+    # Step 3.5: Security Baseline (DC only)
+    # ========================
+    if ($isDC) {
+        Write-Host "`n============================================" -ForegroundColor Magenta
+        Write-Host "  STEP 3.5: Microsoft Security Baseline GPOs" -ForegroundColor Magenta
+        Write-Host "============================================" -ForegroundColor Magenta
+        $applyBaseline = Read-Host -Prompt "Do you want to apply Microsoft Security Baseline GPOs? (yes/no)"
+        if ($applyBaseline -eq "yes") {
+            Apply-SecurityBaseline
+        } else {
+            Write-Host "[*] Skipping Security Baseline" -ForegroundColor Yellow
+        }
     }
 
     # ========================
