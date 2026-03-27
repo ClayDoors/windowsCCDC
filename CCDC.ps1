@@ -435,6 +435,7 @@ function Get-Tools {
         @{ Name = "Firefox";        Url = "https://download.mozilla.org/?product=firefox-stub&os=win&lang=en-US";                                              Out = "C:\Tools\FirefoxInstaller.exe" }
         @{ Name = "LDAP Firewall";  Url = "https://github.com/zeronetworks/ldapfw/releases/download/v1.0.0/ldapfw_v1.0.0-x64.zip";                            Out = "C:\Tools\ldapfw.zip" }
         @{ Name = "ALTools";        Url = "https://download.microsoft.com/download/1/f/0/1f0e9569-3350-4329-b443-822976f29284/ALTools.exe";                    Out = "C:\Tools\ALTools.exe" }
+        @{ Name = "Wireshark Portable"; Url = "https://www.wireshark.org/download/win64/WiresharkPortable64_latest.paf.exe";                                    Out = "C:\Tools\WiresharkPortable.exe" }
     )
 
     # Only download sysmon-config if not found locally
@@ -489,6 +490,23 @@ function Get-Tools {
     Invoke-WebRequest https://raw.githubusercontent.com/zeronetworks/ldapfw/refs/heads/master/example_configs/DACLPrevention_config.json -OutFile "C:\Tools\ldapfw\DACLPrevention_config.json"
     Move-Item "C:\Tools\ldapfw\DACLPrevention_config.json" "C:\Tools\ldapfw\config.json" -Force
     Write-Host "[+] Downloaded LDAP Firewall configuration"
+
+    # --- Install Wireshark Portable (tshark) ---
+    $wiresharkExe = "C:\Tools\WiresharkPortable.exe"
+    if (Test-Path $wiresharkExe) {
+        Write-Host "[+] Installing Wireshark Portable silently..." -ForegroundColor Cyan
+        # PortableApps format: extract with /S (silent) to a directory
+        Start-Process -FilePath $wiresharkExe -ArgumentList "/S /D=C:\Tools\WiresharkPortable" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        if (Test-Path "C:\Tools\WiresharkPortable\App\Wireshark\tshark.exe") {
+            Write-Host "[+] tshark installed at C:\Tools\WiresharkPortable\App\Wireshark\tshark.exe" -ForegroundColor Green
+        } else {
+            Write-Host "[!] tshark not found after install - you may need to install Wireshark manually" -ForegroundColor Yellow
+            Write-Host "[!] Or install tshark via: winget install WiresharkFoundation.Wireshark" -ForegroundColor Yellow
+        }
+        Remove-Item $wiresharkExe -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "[!] Wireshark Portable download not found - skipping tshark install" -ForegroundColor Yellow
+    }
 
     Write-Host "[+] Done!" -ForegroundColor Green
 }
@@ -1286,6 +1304,28 @@ function win-ccdc {
     Write-Host "============================================" -ForegroundColor Magenta
     Get-Tools
 
+    # --- Start background tshark capture (90 seconds) ---
+    $tsharkPaths = @(
+        "C:\Tools\WiresharkPortable\App\Wireshark\tshark.exe",
+        "C:\Program Files\Wireshark\tshark.exe",
+        "${env:ProgramFiles(x86)}\Wireshark\tshark.exe"
+    )
+    $tshark = $tsharkPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $pcapFile = Join-Path $desktopPath "capture_$timestamp.pcapng"
+
+    if ($tshark) {
+        Write-Host "[+] Starting 90-second tshark capture in background -> $pcapFile" -ForegroundColor Cyan
+        $tsharkJob = Start-Job -ScriptBlock {
+            param($tsharkPath, $outFile)
+            & $tsharkPath -a duration:90 -w $outFile 2>&1
+        } -ArgumentList $tshark, $pcapFile
+        Write-Host "[+] tshark capture running as background job (ID: $($tsharkJob.Id))" -ForegroundColor Green
+    } else {
+        Write-Host "[!] tshark not found - skipping background packet capture" -ForegroundColor Yellow
+        Write-Host "[!] Install Wireshark or re-run Get-Tools to enable" -ForegroundColor Yellow
+        $tsharkJob = $null
+    }
+
     $installSI = Read-Host -Prompt "Do you want to download System Informer? (yes/no)"
     if ($installSI -eq "yes") {
         Get-SystemInformer
@@ -1408,6 +1448,21 @@ function win-ccdc {
     Write-Host "============================================" -ForegroundColor Magenta
     Phase2
 
+    # --- Wait for tshark if still running ---
+    if ($tsharkJob) {
+        if ($tsharkJob.State -eq 'Running') {
+            Write-Host "`n[+] Waiting for tshark capture to finish..." -ForegroundColor Cyan
+            Wait-Job $tsharkJob | Out-Null
+        }
+        if ($tsharkJob.State -eq 'Completed') {
+            Write-Host "[+] tshark capture saved to: $pcapFile" -ForegroundColor Green
+        } else {
+            Write-Host "[!] tshark capture may have encountered an error (State: $($tsharkJob.State))" -ForegroundColor Yellow
+            Receive-Job $tsharkJob | Write-Host
+        }
+        Remove-Job $tsharkJob -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host "`n============================================" -ForegroundColor Green
     Write-Host "  win-ccdc complete!" -ForegroundColor Green
     Write-Host "============================================" -ForegroundColor Green
@@ -1419,4 +1474,7 @@ function win-ccdc {
         Write-Host "  - Certify ADCS: $certifyOutput" -ForegroundColor Cyan
     }
     Write-Host "  - WDAC Policy: $desktopPath\SiPolicy.p7b" -ForegroundColor Cyan
+    if ($tsharkJob) {
+        Write-Host "  - Packet Capture: $pcapFile" -ForegroundColor Cyan
+    }
 }
