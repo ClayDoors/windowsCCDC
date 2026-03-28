@@ -588,11 +588,9 @@ function Enumerate {
         }
     })
 
-    # Get process details
-    Get-CimInstance Win32_Process | ForEach-Object {
+    # Get process details (no WMI - uses Get-Process -IncludeUserName)
+    Get-Process -IncludeUserName -ErrorAction SilentlyContinue | ForEach-Object {
         $proc = $_
-        $owner = $proc | Invoke-CimMethod -MethodName GetOwner
-        $commandLine = $proc.CommandLine
         $sessionId = $proc.SessionId
 
         # Match session ID to session name
@@ -600,9 +598,10 @@ function Enumerate {
         if (-not $sessionName) { $sessionName = "Unknown" }
 
         [PSCustomObject]@{
-            UserName    = "$($owner.Domain)\$($owner.User)"
-            ProcessID   = $proc.ProcessId
-            CommandLine = $commandLine
+            UserName    = $proc.UserName
+            ProcessID   = $proc.Id
+            ProcessName = $proc.ProcessName
+            Path        = $proc.Path
             SessionName = $sessionName
             SessionId   = $sessionId
         }
@@ -610,7 +609,7 @@ function Enumerate {
     Write-Output "==========END PROCESSES=========="
 
     Write-Output "==========START SERVICES=========="
-    $svc = Get-CimInstance Win32_Service | Select-Object Name, PathName
+    $svc = Get-Service | Select-Object Name, @{N='PathName';E={(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)" -ErrorAction SilentlyContinue).ImagePath}}
     Write-Output $svc
     Write-Output "==========END SERVICES=========="
 
@@ -694,18 +693,18 @@ function Guest-Service {
     # Prompt for password input for the Guest account
     $password = Read-Host -AsSecureString "Enter the password for the $username account"
 
-    # Convert the secure password to plain text for CIM interaction
+    # Convert the secure password to plain text for sc.exe
     $passwordPlainText = [System.Net.NetworkCredential]::new('', $password).Password
 
     # Prompt for the service name
     $serviceName = Read-Host "Enter the service name to manage"
 
-    # Use CIM to get the service object
-    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name = '$serviceName'"
+    # Check if service exists (no WMI)
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 
     if ($service) {
-        # Change the service credentials using CIM
-        Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ StartName = $username; StartPassword = $passwordPlainText } > $null
+        # Change the service credentials using sc.exe (no WMI needed)
+        sc.exe config $serviceName obj= $username password= $passwordPlainText > $null
 
         # Restart the service
         Restart-Service -Name $serviceName -Force # this will fail if u put random creds and its ok
@@ -827,16 +826,41 @@ function Phase2 {
         Write-Host "[*] Skipping LSA protections" -ForegroundColor Yellow
     }
 
+    $setLockout = Read-Host -Prompt "Set account lockout policy (3 attempts, 15-min lockout)? (yes/no)"
+    if ($setLockout -eq "yes") {
+        Write-Host "[+] Setting account lockout policy..." -ForegroundColor Cyan
+        net accounts /lockoutthreshold:3
+        net accounts /lockoutduration:15
+        net accounts /lockoutwindow:15
+        Write-Host "[+] Local lockout policy set: 3 attempts, 15-min lockout, 15-min reset" -ForegroundColor Green
+
+        # On DCs, also set via AD to make it domain-wide and GPO-persistent
+        $productType = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType
+        if ($productType -eq "LanmanNT") {
+            try {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain) `
+                    -LockoutThreshold 3 `
+                    -LockoutDuration "00:15:00" `
+                    -LockoutObservationWindow "00:15:00"
+                Write-Host "[+] Domain lockout policy set via AD Default Domain Password Policy" -ForegroundColor Green
+            } catch {
+                Write-Host "[!] Failed to set domain lockout policy: $_" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-Host "[*] Skipping account lockout policy" -ForegroundColor Yellow
+    }
+
     Write-Host "[!] Finished Phase2!!`n" -ForegroundColor Green
     Write-Host "Things to do:`n* Run 'svcstuff'`n* Begin firewall rules!" -ForegroundColor Yellow
 }
 
 function Generate-WDAC {
-    param([switch] $Refresh)
-
     $PolicyPath=$env:userprofile+"\Desktop\"
-    $PolicyName="Policy"
-    $Policy=$PolicyPath+$PolicyName+".xml"
+    $EnumPolicy=$PolicyPath+"enum.xml"
+    $ChillPolicy=$PolicyPath+"chill.xml"
+    $AggroPolicy=$PolicyPath+"aggro.xml"
     $DriversPolicy=$PolicyPath+"drivers.xml"
     $IISPolicy=$PolicyPath+"inetsrv.xml"
     $pf64Policy=$PolicyPath+"pf64.xml"
@@ -865,7 +889,7 @@ function Generate-WDAC {
     # -------------------------------------------------------------------------
 
     $DefaultWindowsPolicy = $dst
-    New-Item $Policy -Force > $null
+    New-Item $EnumPolicy -Force > $null
 
     if (Test-Path "C:\Program Files\Microsoft\Exchange Server\") {
         Write-Host "[!] Detected an Exchange server! Policy creation for this type of server will result in issues" -ForegroundColor Red
@@ -897,6 +921,31 @@ function Generate-WDAC {
     $jobIds = @($pf64.Id, $pf32.Id, $pd.Id, $tools.Id, $drivers.Id)
     $jobNames = @{ $pf64.Id = $pf64.Name; $pf32.Id = $pf32.Name; $pd.Id = $pd.Name; $tools.Id = $tools.Name; $drivers.Id = $drivers.Name }
     if ($iis) { $jobIds += $iis.Id; $jobNames[$iis.Id] = $iis.Name }
+
+    # --- Prompt for additional C:\ directories not already being scanned ---
+    $knownDirs = @("Program Files", "Program Files (x86)", "ProgramData", "Tools", "Windows")
+    $topLevelDirs = Get-ChildItem -Path "C:\" -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $knownDirs -notcontains $_.Name }
+
+    $extraPolicyFiles = @()
+    if ($topLevelDirs.Count -gt 0) {
+        Write-Host "`n[?] Found $($topLevelDirs.Count) additional top-level directories on C:\:" -ForegroundColor Yellow
+        foreach ($dir in $topLevelDirs) {
+            $answer = Read-Host -Prompt "  Scan $($dir.FullName) for WDAC policy? (yes/no)"
+            if ($answer -eq "yes") {
+                $extraPolicyFile = Join-Path $PolicyPath "extra_$($dir.Name).xml"
+                $extraPolicyFiles += $extraPolicyFile
+                $extraJob = Start-Job -Name "extra ($($dir.Name))" -ScriptBlock {
+                    param($policyFile, $scanPath)
+                    New-CIPolicy -FilePath $policyFile -Level FilePublisher -Fallback Hash,FileName -ScanPath $scanPath -UserPEs
+                } -ArgumentList $extraPolicyFile, $dir.FullName
+                $jobIds += $extraJob.Id
+                $jobNames[$extraJob.Id] = $extraJob.Name
+                Write-Host "  [>] Started scan job: $($dir.FullName)" -ForegroundColor Cyan
+            }
+        }
+    }
+
     $completedIds = @{}
 
     Write-Host "[+] Waiting for $($jobIds.Count) scan jobs to complete..." -ForegroundColor Cyan
@@ -940,7 +989,9 @@ function Generate-WDAC {
     }
     Remove-Job $pf64,$pf32,$pd,$drivers,$tools
 
-    # Build list of policy files that actually exist for merging
+    # ================================================================
+    # ENUM POLICY - enumeration-based allowlist from scanned directories
+    # ================================================================
     $policiesToMerge = @($DefaultWindowsPolicy)
     foreach ($p in @($pf64Policy, $pf32Policy, $pdPolicy, $DriversPolicy, $toolsPolicy)) {
         if (Test-Path $p) {
@@ -949,52 +1000,84 @@ function Generate-WDAC {
             Write-Host "[!] Skipping missing scan policy: $p" -ForegroundColor Yellow
         }
     }
+    # Include any extra scanned directories
+    foreach ($ep in $extraPolicyFiles) {
+        if (Test-Path $ep) { $policiesToMerge += $ep }
+    }
 
-    $additional_blocks = New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssadmin.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssuirun.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\ntdsutil.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\reg.exe -Deny
-    #$additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\wmic.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\certutil.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\mshta.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\wscript.exe -Deny
-    $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\cscript.exe -Deny
-    Write-Host "[+] Generated policies!" -ForegroundColor Green
-    
-    Write-Host "[+] Merging policies..."
-    Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $policiesToMerge > $null
-    Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $Policy -Rules $additional_blocks > $null
-    if (Test-Path $IISPolicy) { Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $Policy,$IISPolicy > $null }
-    Write-Host "[+] Merged policies"
-    
-    Set-CIPolicyIdInfo -FilePath $Policy -PolicyName $PolicyName
-    Set-CIPolicyVersion -FilePath $Policy -Version "1.0.0.0"
-    Set-RuleOption -FilePath $Policy -Option 3 -Delete  # Audit Mode
-    Set-RuleOption -FilePath $Policy -Option 6          # Unsigned Policy
-    Set-RuleOption -FilePath $Policy -Option 8 -Delete  # Required:EV Signers
-    Set-RuleOption -FilePath $Policy -Option 9          # Advanced Boot Menu
-    Set-RuleOption -FilePath $Policy -Option 10         # Boot Audit on Failure
-    Set-RuleOption -FilePath $Policy -Option 12         # Enforce Store Apps
+    Write-Host "[+] Merging enum policy ($($policiesToMerge.Count) sources)..."
+    Merge-CIPolicy -OutputFilePath $EnumPolicy -PolicyPaths $policiesToMerge > $null
+    if (Test-Path $IISPolicy) { Merge-CIPolicy -OutputFilePath $EnumPolicy -PolicyPaths $EnumPolicy,$IISPolicy > $null }
+    Write-Host "[+] Enum policy merged" -ForegroundColor Green
 
     # Option 19 (Dynamic Code Security) requires Server 2019+ / Win10 1903+
     $osBuild = [System.Environment]::OSVersion.Version.Build
-    if ($osBuild -ge 17763) {
-        Set-RuleOption -FilePath $Policy -Option 19     # Dynamic Code Security
-    } else {
-        Write-Host "[!] Skipping option 19 - not supported on this OS (build $osBuild)" -ForegroundColor Yellow
-    }
-    Write-Host "[+] Added configuration rules to policy!"
 
-    $PolicyBin = $PolicyPath+"SiPolicy.p7b"
-    ConvertFrom-CIPolicy -XmlFilePath $Policy -BinaryFilePath $PolicyBin > $null
-    Write-Host "[+] Generated policy at $PolicyBin"
+    # Helper: apply standard rule options to a policy file
+    function Set-WDACPolicyOptions {
+        param([string]$FilePath, [string]$Name)
+        Set-CIPolicyIdInfo -FilePath $FilePath -PolicyName $Name -ResetPolicyID | Out-Null
+        Set-CIPolicyVersion -FilePath $FilePath -Version "1.0.0.0"
+        Set-RuleOption -FilePath $FilePath -Option 3 -Delete  # Enforce (not audit)
+        Set-RuleOption -FilePath $FilePath -Option 6          # Unsigned Policy
+        Set-RuleOption -FilePath $FilePath -Option 8 -Delete  # Remove Required:EV Signers
+        Set-RuleOption -FilePath $FilePath -Option 9          # Advanced Boot Menu
+        Set-RuleOption -FilePath $FilePath -Option 10         # Boot Audit on Failure
+        Set-RuleOption -FilePath $FilePath -Option 12         # Enforce Store Apps
+        if ($osBuild -ge 17763) {
+            Set-RuleOption -FilePath $FilePath -Option 19     # Dynamic Code Security
+        }
+    }
+
+    Set-WDACPolicyOptions -FilePath $EnumPolicy -Name "enum"
+    Write-Host "[+] Configured enum policy" -ForegroundColor Green
+
+    # ================================================================
+    # CHILL POLICY - low break-rate lolbin deny rules
+    # ================================================================
+    Write-Host "[+] Building chill policy (low-risk lolbin blocks)..." -ForegroundColor Cyan
+    Copy-Item $DefaultWindowsPolicy $ChillPolicy -Force
+
+    $chillBlocks = @()
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssadmin.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssuirun.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\ntdsutil.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\reg.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\certutil.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\mshta.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\wscript.exe -Deny
+    $chillBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\cscript.exe -Deny
+
+    Merge-CIPolicy -OutputFilePath $ChillPolicy -PolicyPaths $ChillPolicy -Rules $chillBlocks > $null
+    Set-WDACPolicyOptions -FilePath $ChillPolicy -Name "chill"
+    Write-Host "[+] Chill policy built" -ForegroundColor Green
+
+    # ================================================================
+    # AGGRO POLICY - aggressive lolbin blocks (may break things!)
+    # ================================================================
+    Write-Host "[+] Building aggro policy (aggressive lolbin blocks)..." -ForegroundColor Cyan
+    Write-Host "[!] WARNING: Aggro policy blocks cmd.exe, rundll32.exe, wmiprvse.exe" -ForegroundColor Red
+    Write-Host "[!] This WILL break some admin tooling and WMI-based management" -ForegroundColor Red
+    Copy-Item $DefaultWindowsPolicy $AggroPolicy -Force
+
+    $aggroBlocks = @()
+    $aggroBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\cmd.exe -Deny
+    $aggroBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\rundll32.exe -Deny
+    $aggroBlocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\wbem\wmiprvse.exe -Deny
+
+    Merge-CIPolicy -OutputFilePath $AggroPolicy -PolicyPaths $AggroPolicy -Rules $aggroBlocks > $null
+    Set-WDACPolicyOptions -FilePath $AggroPolicy -Name "aggro"
+    Write-Host "[+] Aggro policy built" -ForegroundColor Green
+
+    Write-Host "`n[+] All 3 WDAC policies generated:" -ForegroundColor Green
+    Write-Host "    - enum.xml  : Enumeration-based allowlist" -ForegroundColor Cyan
+    Write-Host "    - chill.xml : Low-risk lolbin deny rules" -ForegroundColor Cyan
+    Write-Host "    - aggro.xml : Aggressive lolbin blocks (cmd, rundll32, wmiprvse)" -ForegroundColor Cyan
 
     # =========================================================
     # DC-only: Configure WDAC block notification message via GPO
     # =========================================================
-    $domainRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
-    # DomainRole: 4 = Backup Domain Controller, 5 = Primary Domain Controller
-    $isDC = $domainRole -eq 4 -or $domainRole -eq 5
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if ($isDC) {
         Write-Host "`n[+] Domain Controller detected - configuring WDAC block message in Default Domain Policy..." -ForegroundColor Cyan
@@ -1009,8 +1092,6 @@ function Generate-WDAC {
 
         try {
             Import-Module GroupPolicy -ErrorAction Stop
-
-            # Verify Default Domain Policy exists before modifying
             Get-GPO -Name "Default Domain Policy" -ErrorAction Stop | Out-Null
 
             Set-GPRegistryValue -Name "Default Domain Policy" `
@@ -1029,71 +1110,69 @@ function Generate-WDAC {
         Write-Host "[~] Not a domain controller - skipping WDAC GPO block message configuration" -ForegroundColor DarkGray
     }
 
-    if ($Refresh) {
-        Write-Host "[+] Refreshing policy..."
-        try {
-            copy $PolicyBin "C:\Windows\System32\CodeIntegrity\"
-            Write-Host "[+] Moved policy!"
-            Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"} > $null
-            Write-Host "[+] Refreshed policy!" -ForegroundColor Green
-            Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
-        } catch {
-            Write-Host "[!] Failed to copy policy! Is controlled folder access on?" -ForegroundColor Red
-        }
-    }
-    Write-Host "[+] Exiting..."
+    Write-Host "[+] Done! Run Refresh-WDAC to deploy all policies." -ForegroundColor Green
 }
 
 function Refresh-WDAC {
-    param(
-        [string]$PolicyXml = "$env:USERPROFILE\Desktop\Policy.xml"
-    )
-
-    if (-not (Test-Path $PolicyXml)) {
-        Write-Host "[!] Policy XML not found at $PolicyXml" -ForegroundColor Red
-        return
-    }
-
-    # Extract PolicyID from XML to name the .cip file correctly (multi-policy format)
-    [xml]$xml = Get-Content $PolicyXml
-    $policyId = $xml.SiPolicy.PolicyID
-    if (-not $policyId) {
-        Write-Host "[!] Could not read PolicyID from $PolicyXml" -ForegroundColor Red
-        return
-    }
-    Write-Host "[+] PolicyID: $policyId" -ForegroundColor Cyan
-
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
+    $policyFiles = @("enum.xml", "chill.xml", "aggro.xml")
     $activeDir = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
-    $cipPath   = Join-Path $activeDir "$policyId.cip"
 
     if (-not (Test-Path $activeDir)) {
         New-Item -ItemType Directory -Path $activeDir -Force | Out-Null
     }
 
-    Write-Host "[+] Converting $PolicyXml -> $cipPath" -ForegroundColor Cyan
-    ConvertFrom-CIPolicy -XmlFilePath $PolicyXml -BinaryFilePath $cipPath | Out-Null
-
     $citool = "$env:windir\System32\citool.exe"
     if (-not (Test-Path $citool)) {
-        Write-Host "[!] citool.exe not found - falling back to CimMethod" -ForegroundColor Yellow
-        Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = $cipPath}
+        Write-Host "[!] citool.exe not found - cannot deploy policies" -ForegroundColor Red
+        Write-Host "[!] citool is required (Windows 11 / Server 2022+). WMI fallback removed to support aggro policy." -ForegroundColor Yellow
         return
     }
 
-    Write-Host "[+] Deploying policy..." -ForegroundColor Cyan
-    & $citool --update-policy $cipPath
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[!] citool --update-policy exited with code $LASTEXITCODE" -ForegroundColor Red
+    $deployed = 0
+
+    foreach ($fileName in $policyFiles) {
+        $policyXml = Join-Path $desktopPath $fileName
+
+        if (-not (Test-Path $policyXml)) {
+            Write-Host "[!] $fileName not found on Desktop - skipping" -ForegroundColor Yellow
+            continue
+        }
+
+        [xml]$xml = Get-Content $policyXml
+        $policyId = $xml.SiPolicy.PolicyID
+        if (-not $policyId) {
+            Write-Host "[!] Could not read PolicyID from $fileName - skipping" -ForegroundColor Red
+            continue
+        }
+
+        $cipPath = Join-Path $activeDir "$policyId.cip"
+        Write-Host "[+] Converting $fileName (ID: $policyId) -> $cipPath" -ForegroundColor Cyan
+        ConvertFrom-CIPolicy -XmlFilePath $policyXml -BinaryFilePath $cipPath | Out-Null
+
+        & $citool --update-policy $cipPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[!] citool --update-policy failed for $fileName (exit $LASTEXITCODE)" -ForegroundColor Red
+        } else {
+            Write-Host "[+] Deployed $fileName" -ForegroundColor Green
+            $deployed++
+        }
+    }
+
+    if ($deployed -eq 0) {
+        Write-Host "[!] No policies were deployed" -ForegroundColor Red
         return
     }
 
-    Write-Host "[+] Refreshing policies..." -ForegroundColor Cyan
+    Write-Host "[+] Refreshing all policies..." -ForegroundColor Cyan
     & $citool --refresh
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "[+] Policy refreshed successfully" -ForegroundColor Green
+        Write-Host "[+] All $deployed policies refreshed successfully" -ForegroundColor Green
     } else {
         Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
     }
+
+    Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
 }
 
 function Get-GroupMembersRecursive {
@@ -1123,11 +1202,10 @@ Function Add-UsersToGroup {
 
 function Apply-SecurityBaseline {
     # Requires the GroupPolicy module (available on DCs and RSAT-installed machines)
-    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-    $isDC = $domainRole -ge 4
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if (-not $isDC) {
-        Write-Host "[!] This machine is not a Domain Controller (DomainRole=$domainRole)" -ForegroundColor Red
+        Write-Host "[!] This machine is not a Domain Controller" -ForegroundColor Red
         Write-Host "[!] Security Baseline GPO import requires a DC. Exiting." -ForegroundColor Red
         return
     }
@@ -1192,24 +1270,50 @@ function Apply-SecurityBaseline {
         }
     }
 
-    # --- Import baselines into the Default Domain Policy ---
+    # --- Import each baseline as its own GPO and link to domain root ---
+    # Creating dedicated GPOs per baseline avoids clobbering the Default Domain Policy
+    $domainDN = (Get-ADDomain).DistinguishedName
     $ddpName = "Default Domain Policy"
-    $ddp = Get-GPO -Name $ddpName -ErrorAction SilentlyContinue
-    if (-not $ddp) {
-        Write-Host "[!] Could not find '$ddpName' - is this a domain controller?" -ForegroundColor Red
-        return
-    }
 
-    Write-Host "`n[+] Importing security baseline settings into '$ddpName'..." -ForegroundColor Cyan
-    $backupLocation = ($gpoBackups[0].FullName | Split-Path -Parent)
+    Write-Host "`n[+] Importing security baseline GPOs and linking to domain root..." -ForegroundColor Cyan
 
     foreach ($gpo in $gpoBackups) {
         $gpoGuid = $gpo.Name
+        $backupLocation = $gpo.FullName | Split-Path -Parent
+
+        # Read display name from backup metadata
+        $gpoDisplayName = "Security Baseline - $gpoGuid"
+        $infoFile = Join-Path $gpo.FullName "bkupInfo.xml"
+        if (-not (Test-Path $infoFile)) { $infoFile = Join-Path $gpo.FullName "backup.xml" }
+        if (Test-Path $infoFile) {
+            [xml]$info = Get-Content $infoFile
+            $name = $info.BackupInst.GPODisplayName.'#cdata-section'
+            if ($name) { $gpoDisplayName = "Baseline - $name" }
+        }
+
         try {
-            Import-GPO -BackupId $gpoGuid -Path $backupLocation -TargetName $ddpName -CreateIfNeeded -ErrorAction Stop
-            Write-Host "    [+] Imported $gpoGuid" -ForegroundColor Green
+            # Check if GPO already exists (re-run safety)
+            $existingGpo = Get-GPO -Name $gpoDisplayName -ErrorAction SilentlyContinue
+            if ($existingGpo) {
+                Write-Host "    [~] GPO '$gpoDisplayName' already exists - reimporting settings" -ForegroundColor Yellow
+            } else {
+                New-GPO -Name $gpoDisplayName -ErrorAction Stop | Out-Null
+                Write-Host "    [+] Created GPO: $gpoDisplayName" -ForegroundColor Green
+            }
+
+            Import-GPO -BackupId $gpoGuid -Path $backupLocation -TargetName $gpoDisplayName -ErrorAction Stop
+            Write-Host "    [+] Imported backup into $gpoDisplayName" -ForegroundColor Green
+
+            # Link to domain root (skip if already linked)
+            $existingLink = Get-GPInheritance -Target $domainDN | Select-Object -ExpandProperty GpoLinks | Where-Object { $_.DisplayName -eq $gpoDisplayName }
+            if (-not $existingLink) {
+                New-GPLink -Name $gpoDisplayName -Target $domainDN -LinkEnabled Yes -ErrorAction Stop | Out-Null
+                Write-Host "    [+] Linked $gpoDisplayName to $domainDN" -ForegroundColor Green
+            } else {
+                Write-Host "    [~] $gpoDisplayName already linked to domain root" -ForegroundColor Yellow
+            }
         } catch {
-            Write-Host "    [!] Failed to import $gpoGuid : $_" -ForegroundColor Red
+            Write-Host "    [!] Failed to process $gpoGuid : $_" -ForegroundColor Red
         }
     }
 
@@ -1336,9 +1440,8 @@ function win-ccdc {
     # ========================
     # Step 3: DC-only tasks
     # ========================
-    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-    # DomainRole 4 = Backup DC, 5 = Primary DC
-    $isDC = $domainRole -ge 4
+    # ProductType "LanmanNT" = Domain Controller (no WMI needed)
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if ($isDC) {
         Write-Host "`n============================================" -ForegroundColor Magenta
@@ -1380,7 +1483,7 @@ function win-ccdc {
             Write-Host "[!] Certify.exe not found at $certifyExe" -ForegroundColor Red
         }
     } else {
-        Write-Host "`n[*] Not a Domain Controller (DomainRole=$domainRole) - skipping DC-only tasks" -ForegroundColor Yellow
+        Write-Host "`n[*] Not a Domain Controller - skipping DC-only tasks" -ForegroundColor Yellow
     }
 
     # ========================
@@ -1419,25 +1522,12 @@ function win-ccdc {
     Write-Host "============================================" -ForegroundColor Magenta
     Generate-WDAC
 
-    $enableWDAC = Read-Host -Prompt "Do you want to enable the WDAC policy now? (yes/no)"
+    $enableWDAC = Read-Host -Prompt "Do you want to enable the WDAC policies now? (yes/no)"
     if ($enableWDAC -eq "yes") {
-        $policyBin = Join-Path $desktopPath "SiPolicy.p7b"
-        if (Test-Path $policyBin) {
-            try {
-                Copy-Item $policyBin "C:\Windows\System32\CodeIntegrity\" -Force
-                Write-Host "[+] Copied WDAC policy to CodeIntegrity" -ForegroundColor Green
-                Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"} > $null
-                Write-Host "[+] WDAC policy refreshed and active!" -ForegroundColor Green
-                Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
-            } catch {
-                Write-Host "[!] Failed to deploy WDAC policy: $_" -ForegroundColor Red
-                Write-Host "[!] Is controlled folder access blocking the copy?" -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host "[!] SiPolicy.p7b not found on Desktop - WDAC generation may have failed" -ForegroundColor Red
-        }
+        Refresh-WDAC
     } else {
-        Write-Host "[*] Skipping WDAC enforcement. Policy is on your Desktop if you want to deploy later." -ForegroundColor Yellow
+        Write-Host "[*] Skipping WDAC enforcement. Policies are on your Desktop (enum.xml, chill.xml, aggro.xml)." -ForegroundColor Yellow
+        Write-Host "[*] Run Refresh-WDAC when ready to deploy." -ForegroundColor Yellow
     }
 
     # ========================
@@ -1473,7 +1563,7 @@ function win-ccdc {
         Write-Host "  - Cable DACL: $cableOutput" -ForegroundColor Cyan
         Write-Host "  - Certify ADCS: $certifyOutput" -ForegroundColor Cyan
     }
-    Write-Host "  - WDAC Policy: $desktopPath\SiPolicy.p7b" -ForegroundColor Cyan
+    Write-Host "  - WDAC Policies: enum.xml, chill.xml, aggro.xml" -ForegroundColor Cyan
     if ($tsharkJob) {
         Write-Host "  - Packet Capture: $pcapFile" -ForegroundColor Cyan
     }
