@@ -792,9 +792,22 @@ function Phase2 {
         Set-MpPreference -DisableArchiveScanning 0
         Set-MpPreference -PUAProtection 1
         Set-MpPreference -EnableControlledFolderAccess Enabled
-        Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\inetpub"
         Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Users\Public\"
         Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Windows\System32\CodeIntegrity\"
+
+        if (Test-Path "C:\inetpub") {
+            Write-Host "[!] IIS detected (C:\inetpub exists)" -ForegroundColor Yellow
+            Write-Host "[!] WARNING: Controlled Folder Access on inetpub will block w3wp.exe writes (logs, uploads, sessions)" -ForegroundColor Yellow
+            $protectInetpub = Read-Host -Prompt "Add C:\inetpub to Controlled Folder Access? (yes/no)"
+            if ($protectInetpub -eq "yes") {
+                Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\inetpub"
+                Add-MpPreference -ControlledFolderAccessAllowedApplications "C:\Windows\System32\inetsrv\w3wp.exe"
+                Write-Host "[+] C:\inetpub protected, w3wp.exe added as allowed app" -ForegroundColor Green
+            } else {
+                Write-Host "[*] Skipping inetpub CFA protection" -ForegroundColor Yellow
+            }
+        }
+
         Write-Host "[+] Defender hardened" -ForegroundColor Green
     } else {
         Write-Host "[*] Skipping Defender hardening" -ForegroundColor Yellow
@@ -1269,6 +1282,372 @@ Function Add-UsersToGroup {
             Write-Host "[-] Skill issue for user $User" -ForegroundColor Red
         }
     }
+}
+
+function Setup-SSH {
+    # ============================================================
+    # Install OpenSSH Server if not present
+    # ============================================================
+    $sshCapability = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Server*" }
+    if ($sshCapability.State -ne "Installed") {
+        Write-Host "[+] Installing OpenSSH Server..." -ForegroundColor Cyan
+        Add-WindowsCapability -Online -Name $sshCapability.Name
+        Write-Host "[+] OpenSSH Server installed" -ForegroundColor Green
+    } else {
+        Write-Host "[+] OpenSSH Server already installed" -ForegroundColor Green
+    }
+
+    # Ensure the service is running and set to auto start
+    Set-Service -Name sshd -StartupType Automatic
+    Start-Service sshd -ErrorAction SilentlyContinue
+    Write-Host "[+] sshd service started and set to automatic" -ForegroundColor Green
+
+    # Set PowerShell as the default shell instead of cmd.exe
+    $shellRegPath = "HKLM:\SOFTWARE\OpenSSH"
+    if (-not (Test-Path $shellRegPath)) { New-Item -Path $shellRegPath -Force | Out-Null }
+    $pwshPath = (Get-Command powershell.exe).Source
+    New-ItemProperty -Path $shellRegPath -Name "DefaultShell" -Value $pwshPath -PropertyType String -Force | Out-Null
+    Write-Host "[+] Default SSH shell set to PowerShell" -ForegroundColor Green
+
+    # ============================================================
+    # Prompts
+    # ============================================================
+    $sshScored = Read-Host -Prompt "Is SSH a scored service? (yes/no)"
+    $rdpScored = Read-Host -Prompt "Is RDP a scored service? (yes/no)"
+
+    # ============================================================
+    # Generate SSH key for Administrator if one doesn't exist
+    # ============================================================
+    $adminKeyDir = "$env:USERPROFILE\.ssh"
+    $adminKeyFile = Join-Path $adminKeyDir "id_ed25519"
+    if (-not (Test-Path $adminKeyFile)) {
+        if (-not (Test-Path $adminKeyDir)) { New-Item -ItemType Directory -Path $adminKeyDir -Force | Out-Null }
+        Write-Host "[+] Generating Administrator SSH key..." -ForegroundColor Cyan
+        ssh-keygen -t ed25519 -f $adminKeyFile -N '""' -q
+        Write-Host "[+] SSH key generated at $adminKeyFile" -ForegroundColor Green
+    } else {
+        Write-Host "[+] Administrator SSH key already exists at $adminKeyFile" -ForegroundColor Green
+    }
+
+    # Install the public key into administrators_authorized_keys
+    $adminAuthKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
+    $pubKey = Get-Content "$adminKeyFile.pub"
+    Set-Content -Path $adminAuthKeys -Value $pubKey -Force
+
+    # Fix ACL on administrators_authorized_keys — must be owned by SYSTEM/Administrators only
+    $acl = Get-Acl $adminAuthKeys
+    $acl.SetAccessRuleProtection($true, $false)
+    $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "Allow")
+    $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "Allow")
+    $acl.SetAccessRule($adminRule)
+    $acl.SetAccessRule($systemRule)
+    Set-Acl -Path $adminAuthKeys -AclObject $acl
+    Write-Host "[+] Administrator public key installed to $adminAuthKeys" -ForegroundColor Green
+
+    # Copy private key to Desktop so it's easy to grab via RDP/USB
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
+    Copy-Item $adminKeyFile (Join-Path $desktopPath "id_ed25519") -Force
+    Copy-Item "$adminKeyFile.pub" (Join-Path $desktopPath "id_ed25519.pub") -Force
+    Write-Host "[+] Private key copied to Desktop — transfer this to your local machine!" -ForegroundColor Yellow
+
+    # ============================================================
+    # Install OpenSSH Client (for scp, ssh outbound) if not present
+    # ============================================================
+    $sshClientCap = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Client*" }
+    if ($sshClientCap.State -ne "Installed") {
+        Write-Host "[+] Installing OpenSSH Client (scp, ssh)..." -ForegroundColor Cyan
+        Add-WindowsCapability -Online -Name $sshClientCap.Name
+        Write-Host "[+] OpenSSH Client installed" -ForegroundColor Green
+    } else {
+        Write-Host "[+] OpenSSH Client already installed" -ForegroundColor Green
+    }
+
+    # ============================================================
+    # Write hardened sshd_config
+    # ============================================================
+    $sshdConfig = "C:\ProgramData\ssh\sshd_config"
+    if (Test-Path $sshdConfig) {
+        Copy-Item $sshdConfig "$sshdConfig.bak" -Force
+        Write-Host "[+] Backed up existing sshd_config to sshd_config.bak" -ForegroundColor Cyan
+    }
+
+    # Build config based on whether SSH is scored
+    if ($sshScored -eq "yes") {
+        # SSH is scored — allow password auth so score engine can log in
+        $passwordAuth = "yes"
+        $authMethods = "any"
+        Write-Host "[!] SSH is scored — password authentication enabled" -ForegroundColor Yellow
+    } else {
+        # SSH not scored — lock down to pubkey only for Administrator
+        $passwordAuth = "no"
+        $authMethods = "publickey"
+        Write-Host "[+] SSH not scored — pubkey-only for Administrator" -ForegroundColor Green
+    }
+
+    $configContent = @"
+# Managed by Setup-SSH - CCDC hardening
+Port 22
+ListenAddress 0.0.0.0
+
+# Authentication
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication $passwordAuth
+AuthenticationMethods $authMethods
+PermitEmptyPasswords no
+MaxAuthTries 3
+MaxSessions 2
+
+# Disable forwarding by default
+AllowTcpForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+# Admin authorized keys file (Windows-specific path)
+Match Group administrators
+    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+"@
+
+    # If RDP is not scored, allow TCP forwarding for Administrator only (SSH tunnel for RDP)
+    if ($rdpScored -ne "yes") {
+        $configContent += @"
+
+# RDP not scored — allow SSH tunnel for Administrator only
+Match User Administrator
+    AllowTcpForwarding local
+    PermitTunnel yes
+"@
+    }
+
+    Set-Content -Path $sshdConfig -Value $configContent -Force
+    Write-Host "[+] Hardened sshd_config written" -ForegroundColor Green
+
+    # ============================================================
+    # Restart sshd to apply config
+    # ============================================================
+    Restart-Service sshd
+    Write-Host "[+] sshd restarted with new configuration" -ForegroundColor Green
+
+    # ============================================================
+    # Firewall: ensure SSH is allowed inbound
+    # ============================================================
+    $sshFwRule = Get-NetFirewallRule -DisplayName "OpenSSH Server (sshd)" -ErrorAction SilentlyContinue
+    if (-not $sshFwRule) {
+        New-NetFirewallRule -DisplayName "OpenSSH Server (sshd)" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+        Write-Host "[+] Firewall rule added for SSH (port 22)" -ForegroundColor Green
+    } else {
+        Write-Host "[+] SSH firewall rule already exists" -ForegroundColor Green
+    }
+
+    # ============================================================
+    # RDP handling
+    # ============================================================
+    if ($rdpScored -ne "yes") {
+        Write-Host "[+] RDP not scored — restricting RDP to localhost (SSH tunnel only)" -ForegroundColor Cyan
+
+        # Set RDP to listen on localhost only via registry
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "LanAdapter" -Value 0 -Force 2>$null
+
+        # Block RDP inbound from network — only allow from 127.0.0.1
+        $rdpRules = Get-NetFirewallRule -DisplayName "*Remote Desktop*" -ErrorAction SilentlyContinue
+        $rdpRules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+        New-NetFirewallRule -DisplayName "RDP - Localhost Only (SSH Tunnel)" -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress 127.0.0.1 -Action Allow | Out-Null
+        New-NetFirewallRule -DisplayName "RDP - Block External" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Block | Out-Null
+        Write-Host "[+] RDP firewall: allowed from 127.0.0.1 only, blocked externally" -ForegroundColor Green
+
+        Write-Host "`n[!] To RDP via SSH tunnel, run from your machine:" -ForegroundColor Yellow
+        Write-Host "    ssh -L 3389:127.0.0.1:3389 Administrator@<this-host>" -ForegroundColor Cyan
+        Write-Host "    Then connect RDP to 127.0.0.1:3389" -ForegroundColor Cyan
+    } else {
+        Write-Host "[+] RDP is scored — leaving RDP accessible normally" -ForegroundColor Green
+    }
+
+    # ============================================================
+    # Summary
+    # ============================================================
+    Write-Host "`n[+] SSH Setup Complete" -ForegroundColor Green
+    Write-Host "    SSH Key:  $desktopPath\id_ed25519 (GRAB THIS!)" -ForegroundColor Cyan
+    Write-Host "    Pub Key:  $desktopPath\id_ed25519.pub" -ForegroundColor Cyan
+    Write-Host "    Config:   $sshdConfig" -ForegroundColor Cyan
+    Write-Host "    SCP:      scp available for file transfers" -ForegroundColor Cyan
+    if ($rdpScored -ne "yes") {
+        Write-Host "    RDP:      Tunneled through SSH only" -ForegroundColor Cyan
+    }
+    Write-Host "`n[!] COPY id_ed25519 FROM THE DESKTOP TO YOUR LOCAL MACHINE NOW!" -ForegroundColor Red
+    Write-Host "[!] If you lose it and SSH is pubkey-only, you're locked out!" -ForegroundColor Red
+}
+
+function Email-For-Root-Login {
+    # Prompt for mail server configuration
+    $smtpServer = Read-Host -Prompt "Enter mail server IP or hostname"
+    if ([string]::IsNullOrWhiteSpace($smtpServer)) {
+        Write-Host "[!] Mail server is required. Exiting." -ForegroundColor Red
+        return
+    }
+
+    $smtpPort = Read-Host -Prompt "Enter SMTP port (default 25)"
+    if ([string]::IsNullOrWhiteSpace($smtpPort)) { $smtpPort = "25" }
+
+    $mailUser = Read-Host -Prompt "Enter mail username (e.g. alert@domain.com)"
+    if ([string]::IsNullOrWhiteSpace($mailUser)) {
+        Write-Host "[!] Username is required. Exiting." -ForegroundColor Red
+        return
+    }
+
+    $mailPass = Read-Host -AsSecureString -Prompt "Enter mail password"
+    $mailTo = Read-Host -Prompt "Enter recipient email address"
+    if ([string]::IsNullOrWhiteSpace($mailTo)) { $mailTo = $mailUser }
+
+    $hostname = $env:COMPUTERNAME
+
+    # Create the PowerShell script that sends the email on admin logon
+    $scriptDir = "C:\Tools"
+    if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null }
+    $scriptPath = Join-Path $scriptDir "AdminLoginAlert.ps1"
+
+    # Convert secure string to encrypted standard string (machine-bound)
+    $encPassword = $mailPass | ConvertFrom-SecureString
+
+    $scriptContent = @"
+# Admin Login Alert Script - created by Email-For-Root-Login
+`$smtpServer = "$smtpServer"
+`$smtpPort = $smtpPort
+`$mailUser = "$mailUser"
+`$encPassword = "$encPassword"
+`$mailTo = "$mailTo"
+`$hostname = "$hostname"
+
+# Rebuild credential
+`$secPass = `$encPassword | ConvertTo-SecureString
+`$cred = New-Object System.Management.Automation.PSCredential(`$mailUser, `$secPass)
+
+# Get the logon event details
+`$logonUser = `$env:USERNAME
+`$logonDomain = `$env:USERDOMAIN
+`$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+# Check if the user is an administrator
+`$isAdmin = `$false
+try {
+    `$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    `$principal = New-Object Security.Principal.WindowsPrincipal(`$identity)
+    `$isAdmin = `$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {}
+
+# Also check local Administrators group membership
+if (-not `$isAdmin) {
+    try {
+        `$adminGroup = [ADSI]"WinNT://./Administrators,group"
+        `$members = @(`$adminGroup.Invoke("Members")) | ForEach-Object {
+            `$_.GetType().InvokeMember("Name", 'GetProperty', `$null, `$_, `$null)
+        }
+        if (`$members -contains `$logonUser) { `$isAdmin = `$true }
+    } catch {}
+}
+
+if (`$isAdmin) {
+    `$subject = "[ALERT] Admin login on `$hostname - `$logonDomain\`$logonUser"
+    `$body = @"
+ADMINISTRATOR LOGIN DETECTED
+
+Host:      `$hostname
+User:      `$logonDomain\`$logonUser
+Time:      `$timestamp
+Type:      Interactive Logon
+"@
+
+    try {
+        Send-MailMessage -From `$mailUser -To `$mailTo -Subject `$subject -Body `$body ``
+            -SmtpServer `$smtpServer -Port `$smtpPort -Credential `$cred -ErrorAction Stop
+    } catch {
+        # Retry without TLS in case the mail server doesn't support it
+        try {
+            Send-MailMessage -From `$mailUser -To `$mailTo -Subject `$subject -Body `$body ``
+                -SmtpServer `$smtpServer -Port `$smtpPort -Credential `$cred -ErrorAction Stop
+        } catch {
+            # Silent fail - don't block logon
+        }
+    }
+}
+"@
+
+    Set-Content -Path $scriptPath -Value $scriptContent -Force
+    Write-Host "[+] Alert script created at $scriptPath" -ForegroundColor Green
+
+    # Create a scheduled task that triggers on any user logon
+    $taskName = "AdminLoginEmailAlert"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    # Remove existing task if present
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Write-Host "[+] Scheduled task '$taskName' registered - triggers on any user logon" -ForegroundColor Green
+    Write-Host "[+] Emails will be sent to $mailTo when an admin logs in to $hostname" -ForegroundColor Green
+    Write-Host "[!] Mail password is encrypted and bound to this machine/user context" -ForegroundColor Yellow
+}
+
+function Set-DomainWallpaper {
+    # Requires GroupPolicy module — DC only
+    $domainRole = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions" -ErrorAction SilentlyContinue).ProductType
+    $isDC = $domainRole -eq "LanmanNT"
+    if (-not $isDC) {
+        Write-Host "[!] This machine is not a Domain Controller. Domain wallpaper GPO requires a DC." -ForegroundColor Red
+        return
+    }
+
+    Import-Module GroupPolicy -ErrorAction Stop
+
+    # Prompt for image file
+    Write-Host "[?] Enter the full path to the wallpaper image file (e.g. C:\Users\Administrator\Desktop\wallpaper.jpg):" -ForegroundColor Yellow
+    $imagePath = Read-Host -Prompt "    Image path"
+
+    if ([string]::IsNullOrWhiteSpace($imagePath) -or -not (Test-Path $imagePath)) {
+        Write-Host "[!] Image file not found at '$imagePath'" -ForegroundColor Red
+        return
+    }
+
+    # Copy the image to SYSVOL so all domain machines can access it via the network share
+    $domain = (Get-ADDomain).DNSRoot
+    $sysvolShare = "\\$domain\SYSVOL\$domain\wallpaper"
+    $sysvolLocal = "$env:SystemRoot\SYSVOL\domain\wallpaper"
+
+    if (-not (Test-Path $sysvolLocal)) {
+        New-Item -ItemType Directory -Path $sysvolLocal -Force | Out-Null
+    }
+
+    $fileName = Split-Path $imagePath -Leaf
+    Copy-Item $imagePath (Join-Path $sysvolLocal $fileName) -Force
+    $uncPath = "$sysvolShare\$fileName"
+    Write-Host "[+] Wallpaper copied to SYSVOL: $uncPath" -ForegroundColor Green
+
+    # Set wallpaper via Default Domain Policy GPO registry values
+    $ddpName = "Default Domain Policy"
+    $ddp = Get-GPO -Name $ddpName -ErrorAction SilentlyContinue
+    if (-not $ddp) {
+        Write-Host "[!] Could not find '$ddpName'" -ForegroundColor Red
+        return
+    }
+
+    $desktopKey = "HKCU\Control Panel\Desktop"
+
+    # Wallpaper path
+    Set-GPRegistryValue -Name $ddpName -Key $desktopKey -ValueName "Wallpaper" -Type String -Value $uncPath
+    # Wallpaper style: 2 = Stretch, 0 = Center, 6 = Fit, 10 = Fill
+    Set-GPRegistryValue -Name $ddpName -Key $desktopKey -ValueName "WallpaperStyle" -Type String -Value "10"
+    # Prevent users from changing it
+    $personalizationKey = "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+    Set-GPRegistryValue -Name $ddpName -Key $personalizationKey -ValueName "Wallpaper" -Type String -Value $uncPath
+    Set-GPRegistryValue -Name $ddpName -Key $personalizationKey -ValueName "NoChangingWallPaper" -Type DWord -Value 1
+
+    Write-Host "[+] Domain wallpaper set to '$uncPath' via '$ddpName'" -ForegroundColor Green
+    Write-Host "[+] Users cannot change the wallpaper" -ForegroundColor Green
+    Write-Host "[!] Clients will apply at next gpupdate / logon" -ForegroundColor Yellow
 }
 
 function Apply-SecurityBaseline {
