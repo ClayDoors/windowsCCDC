@@ -436,6 +436,7 @@ function Get-Tools {
         @{ Name = "LDAP Firewall";  Url = "https://github.com/zeronetworks/ldapfw/releases/download/v1.0.0/ldapfw_v1.0.0-x64.zip";                            Out = "C:\Tools\ldapfw.zip" }
         @{ Name = "ALTools";        Url = "https://download.microsoft.com/download/1/f/0/1f0e9569-3350-4329-b443-822976f29284/ALTools.exe";                    Out = "C:\Tools\ALTools.exe" }
         @{ Name = "Wireshark Portable"; Url = "https://www.wireshark.org/download/win64/WiresharkPortable64_latest.paf.exe";                                    Out = "C:\Tools\WiresharkPortable.exe" }
+        @{ Name = "RefreshPolicy";     Url = "https://aka.ms/refreshpolicy";                                                                                     Out = "C:\Tools\RefreshPolicy.exe" }
     )
 
     # Only download sysmon-config if not found locally
@@ -444,7 +445,7 @@ function Get-Tools {
         Copy-Item $localSysmonConfig "C:\Tools\sysmon-config.xml" -Force
     } else {
         Write-Host "  [~] sysmon-config.xml not found locally - will download" -ForegroundColor Yellow
-        $downloads += @{ Name = "Sysmon Config"; Url = "https://raw.githubusercontent.com/SouthwestCCDC/2026-Regionals-Shared/tree/main/The%20University%20of%20Texas%20at%20San%20Antonio/refs/heads/main/2026_Windows/sysmon-config.xml"; Out = "C:\Tools\sysmon-config.xml" }
+        $downloads += @{ Name = "Sysmon Config"; Url = "https://raw.githubusercontent.com/SouthwestCCDC/2026-Regionals-Shared/refs/heads/main/The%20University%20of%20Texas%20at%20San%20Antonio/2026_Windows/sysmon-config.xml"; Out = "C:\Tools\sysmon-config.xml" }
     }
 
     $jobs = @()
@@ -732,6 +733,15 @@ function Phase2 {
         Write-Host "[*] Skipping service shutdown" -ForegroundColor Yellow
     }
 
+    $disableEFS = Read-Host -Prompt "Disable EFS service? Prevents PetitPotam coercion attacks. (yes/no)"
+    if ($disableEFS -eq "yes") {
+        Stop-Service -Name "EFS" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "EFS" -StartupType Disabled -ErrorAction SilentlyContinue
+        Write-Host "[+] EFS service disabled (PetitPotam mitigation)" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Skipping EFS disable" -ForegroundColor Yellow
+    }
+
     $startDefender = Read-Host -Prompt "Start Defender services? (yes/no)"
     if ($startDefender -eq "yes") {
         Get-Service "WinDefend" | Start-Service # Microsoft Defender Antivirus Service - MsMpEng.exe
@@ -773,46 +783,47 @@ function Phase2 {
 
     $hardenDefender = Read-Host -Prompt "Harden Defender (SampleSubmission, protections, signature update)? (yes/no)"
     if ($hardenDefender -eq "yes") {
-    Set-MpPreference -SubmitSamplesConsent SendAllSamples
-    Set-MpPreference -MAPSReporting Advanced
-    Set-MpPreference -DisableIOAVProtection 0
-    Set-MpPreference -DisableRealtimeMonitoring 0
-    Set-MpPreference -DisableBehaviorMonitoring 0
-    Set-MpPreference -DisableScriptScanning 0
-    Set-MpPreference -DisableArchiveScanning 0
-    Set-MpPreference -PUAProtection 1
-    Set-MpPreference -EnableControlledFolderAccess Enabled
-    Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\inetpub"
-    Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Users\Public\"
-    Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Windows\System32\CodeIntegrity\"
-
+        Set-MpPreference -SubmitSamplesConsent SendAllSamples
+        Set-MpPreference -MAPSReporting Advanced
+        Set-MpPreference -DisableIOAVProtection 0
+        Set-MpPreference -DisableRealtimeMonitoring 0
+        Set-MpPreference -DisableBehaviorMonitoring 0
+        Set-MpPreference -DisableScriptScanning 0
+        Set-MpPreference -DisableArchiveScanning 0
+        Set-MpPreference -PUAProtection 1
+        Set-MpPreference -EnableControlledFolderAccess Enabled
+        Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\inetpub"
+        Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Users\Public\"
+        Add-MpPreference -ControlledFolderAccessProtectedFolders "C:\Windows\System32\CodeIntegrity\"
+        Write-Host "[+] Defender hardened" -ForegroundColor Green
     } else {
         Write-Host "[*] Skipping Defender hardening" -ForegroundColor Yellow
     }
 
     $addASR = Read-Host -Prompt "Add ASR rules? (yes/no)"
     if ($addASR -eq "yes") {
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 56a863a9-875e-4185-98a7-b882c64b5ce5 -AttackSurfaceReductionRules_Actions Enabled # Block abuse of exploited vulnerable signed drivers
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c -AttackSurfaceReductionRules_Actions Enabled # Block Adobe Reader from creating child processes
-    Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A -AttackSurfaceReductionRules_Actions Enabled # Block all Office applications from creating child processes
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2 -AttackSurfaceReductionRules_Actions Enabled # Block credential stealing from the Windows local security authority subsystem (lsass.exe)
-    Add-MpPreference -AttackSurfaceReductionRules_Ids BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550 -AttackSurfaceReductionRules_Actions Enabled # Block executable content from email client and webmail
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 01443614-CD74-433A-B99E-2ECDC07BFC25 -AttackSurfaceReductionRules_Actions Enabled # Block executable files from running unless they meet a prevalence, age, or trusted list criterion
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 5BEB7EFE-FD9A-4556-801D-275E5FFC04CC -AttackSurfaceReductionRules_Actions Enabled # Block execution of potentially obfuscated scripts
-    Add-MpPreference -AttackSurfaceReductionRules_Ids D3E037E1-3EB8-44C8-A917-57927947596D -AttackSurfaceReductionRules_Actions Enabled # Block JavaScript or VBScript from launching downloaded executable content
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 3B576869-A4EC-4529-8536-B80A7769E899 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from creating executable content
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from injecting code into other processes
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 26190899-1602-49e8-8b27-eb1d0a1ce869 -AttackSurfaceReductionRules_Actions Enabled # Block Office communication application from creating child processes
-    Add-MpPreference -AttackSurfaceReductionRules_Ids e6db77e5-3df2-4cf1-b95a-636979351e5b -AttackSurfaceReductionRules_Actions Enabled # Block persistence through WMI event subscription, * File and folder exclusions not supported.
-    Add-MpPreference -AttackSurfaceReductionRules_Ids D1E49AAC-8F56-4280-B9BA-993A6D77406C -AttackSurfaceReductionRules_Actions Enabled # Block process creations originating from PSExec and WMI commands
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 33ddedf1-c6e0-47cb-833e-de6133960387 -AttackSurfaceReductionRules_Actions Enabled # Block rebooting machine in Safe Mode (preview)
-    Add-MpPreference -AttackSurfaceReductionRules_Ids B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4 -AttackSurfaceReductionRules_Actions Enabled # Block untrusted and unsigned processes that run from USB
-    Add-MpPreference -AttackSurfaceReductionRules_Ids c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb -AttackSurfaceReductionRules_Actions Enabled # Block use of copied or impersonated system tools (preview)
-    Add-MpPreference -AttackSurfaceReductionRules_Ids a8f5898e-1dc8-49a9-9878-85004b8a61e6 -AttackSurfaceReductionRules_Actions Enabled # Block Webshell creation for Servers
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B -AttackSurfaceReductionRules_Actions Enabled # Block Win32 API calls from Office macros
-    Add-MpPreference -AttackSurfaceReductionRules_Ids C1DB55AB-C21A-4637-BB3F-A12568109D35 -AttackSurfaceReductionRules_Actions Enabled # Use advanced protection against ransomware
-    #Restart-Service WinDefend # YOU CANNOT RESTART WINDEFEND. REBOOT HERE IS REQUIRED
-    Update-MpSignature -AsJob
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 56a863a9-875e-4185-98a7-b882c64b5ce5 -AttackSurfaceReductionRules_Actions Enabled # Block abuse of exploited vulnerable signed drivers
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c -AttackSurfaceReductionRules_Actions Enabled # Block Adobe Reader from creating child processes
+        Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A -AttackSurfaceReductionRules_Actions Enabled # Block all Office applications from creating child processes
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2 -AttackSurfaceReductionRules_Actions Enabled # Block credential stealing from the Windows local security authority subsystem (lsass.exe)
+        Add-MpPreference -AttackSurfaceReductionRules_Ids BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550 -AttackSurfaceReductionRules_Actions Enabled # Block executable content from email client and webmail
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 01443614-CD74-433A-B99E-2ECDC07BFC25 -AttackSurfaceReductionRules_Actions Enabled # Block executable files from running unless they meet a prevalence, age, or trusted list criterion
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 5BEB7EFE-FD9A-4556-801D-275E5FFC04CC -AttackSurfaceReductionRules_Actions Enabled # Block execution of potentially obfuscated scripts
+        Add-MpPreference -AttackSurfaceReductionRules_Ids D3E037E1-3EB8-44C8-A917-57927947596D -AttackSurfaceReductionRules_Actions Enabled # Block JavaScript or VBScript from launching downloaded executable content
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 3B576869-A4EC-4529-8536-B80A7769E899 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from creating executable content
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from injecting code into other processes
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 26190899-1602-49e8-8b27-eb1d0a1ce869 -AttackSurfaceReductionRules_Actions Enabled # Block Office communication application from creating child processes
+        Add-MpPreference -AttackSurfaceReductionRules_Ids e6db77e5-3df2-4cf1-b95a-636979351e5b -AttackSurfaceReductionRules_Actions Enabled # Block persistence through WMI event subscription, * File and folder exclusions not supported.
+        Add-MpPreference -AttackSurfaceReductionRules_Ids D1E49AAC-8F56-4280-B9BA-993A6D77406C -AttackSurfaceReductionRules_Actions Enabled # Block process creations originating from PSExec and WMI commands
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 33ddedf1-c6e0-47cb-833e-de6133960387 -AttackSurfaceReductionRules_Actions Enabled # Block rebooting machine in Safe Mode (preview)
+        Add-MpPreference -AttackSurfaceReductionRules_Ids B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4 -AttackSurfaceReductionRules_Actions Enabled # Block untrusted and unsigned processes that run from USB
+        Add-MpPreference -AttackSurfaceReductionRules_Ids c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb -AttackSurfaceReductionRules_Actions Enabled # Block use of copied or impersonated system tools (preview)
+        Add-MpPreference -AttackSurfaceReductionRules_Ids a8f5898e-1dc8-49a9-9878-85004b8a61e6 -AttackSurfaceReductionRules_Actions Enabled # Block Webshell creation for Servers
+        Add-MpPreference -AttackSurfaceReductionRules_Ids 92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B -AttackSurfaceReductionRules_Actions Enabled # Block Win32 API calls from Office macros
+        Add-MpPreference -AttackSurfaceReductionRules_Ids C1DB55AB-C21A-4637-BB3F-A12568109D35 -AttackSurfaceReductionRules_Actions Enabled # Use advanced protection against ransomware
+        #Restart-Service WinDefend # YOU CANNOT RESTART WINDEFEND. REBOOT HERE IS REQUIRED
+        Update-MpSignature -AsJob
+        Write-Host "[+] ASR rules added" -ForegroundColor Green
     } else {
         Write-Host "[*] Skipping ASR rules" -ForegroundColor Yellow
     }
@@ -876,7 +887,7 @@ function Generate-WDAC {
         Copy-Item $src $dst -Force
     } else {
         Write-Host "[!] DefaultWindows_Enforced.xml not found locally. Downloading from GitHub..." -ForegroundColor Yellow
-        $downloadUrl = "google.com"
+        $downloadUrl = "https://raw.githubusercontent.com/MicrosoftDocs/windows-itpro-docs/public/windows/security/application-security/application-control/app-control-for-business/design/example-policies/DefaultWindows_Enforced.xml"
         try {
             Invoke-WebRequest -Uri $downloadUrl -OutFile $dst -UseBasicParsing -ErrorAction Stop
             Write-Host "[+] Successfully downloaded base policy" -ForegroundColor Green
@@ -1115,18 +1126,60 @@ function Generate-WDAC {
 
 function Refresh-WDAC {
     $desktopPath = [Environment]::GetFolderPath('Desktop')
-    $policyFiles = @("enum.xml", "chill.xml", "aggro.xml")
-    $activeDir = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
+    $activeDir   = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
+    $osBuild     = [System.Environment]::OSVersion.Version.Build
 
+    # Multi-policy requires Win10 1903+ (build 18362) / Server 2019+
+    $supportsMultiPolicy = $osBuild -ge 18362
+
+    if (-not $supportsMultiPolicy) {
+        Write-Host "[!] This OS (build $osBuild) does not support multi-policy WDAC" -ForegroundColor Red
+        Write-Host "[!] Only single-policy SiPolicy.p7b is supported on this version" -ForegroundColor Yellow
+        Write-Host "[+] Falling back to single-policy mode with enum policy only..." -ForegroundColor Cyan
+
+        $enumXml = Join-Path $desktopPath "enum.xml"
+        if (-not (Test-Path $enumXml)) {
+            Write-Host "[!] enum.xml not found on Desktop" -ForegroundColor Red
+            return
+        }
+
+        $singlePolicyPath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"
+        ConvertFrom-CIPolicy -XmlFilePath $enumXml -BinaryFilePath $singlePolicyPath | Out-Null
+        Write-Host "[+] Converted enum.xml -> SiPolicy.p7b" -ForegroundColor Green
+        Write-Host "[!] A REBOOT is required for the policy to take effect" -ForegroundColor Yellow
+        return
+    }
+
+    # --- Multi-policy mode ---
     if (-not (Test-Path $activeDir)) {
         New-Item -ItemType Directory -Path $activeDir -Force | Out-Null
     }
 
-    $citool = "$env:windir\System32\citool.exe"
-    if (-not (Test-Path $citool)) {
-        Write-Host "[!] citool.exe not found - cannot deploy policies" -ForegroundColor Red
-        Write-Host "[!] citool is required (Windows 11 / Server 2022+). WMI fallback removed to support aggro policy." -ForegroundColor Yellow
-        return
+    # Determine refresh tool: citool > RefreshPolicy.exe
+    $citool        = "$env:windir\System32\citool.exe"
+    $refreshPolicy = "C:\Tools\RefreshPolicy.exe"
+    $hasCitool     = Test-Path $citool
+    $hasRefreshExe = Test-Path $refreshPolicy
+
+    if (-not $hasCitool -and -not $hasRefreshExe) {
+        Write-Host "[!] Neither citool.exe nor RefreshPolicy.exe found" -ForegroundColor Red
+        Write-Host "[!] Policies will be copied to CiPolicies\Active but a REBOOT is needed to load them" -ForegroundColor Yellow
+        Write-Host "[!] Download RefreshPolicy.exe from the WDAC Policy Wizard toolkit and place in C:\Tools\" -ForegroundColor Yellow
+    } elseif ($hasCitool) {
+        Write-Host "[+] Using citool.exe for policy deployment" -ForegroundColor Cyan
+    } else {
+        Write-Host "[+] citool.exe not found - using RefreshPolicy.exe" -ForegroundColor Cyan
+    }
+
+    # Prompt for aggro
+    $deployAggro = Read-Host -Prompt "Deploy aggro policy? Blocks cmd.exe, rundll32.exe, wmiprvse.exe. (yes/no)"
+
+    $policyFiles = @("enum.xml", "chill.xml")
+    if ($deployAggro -eq "yes") {
+        $policyFiles += "aggro.xml"
+        Write-Host "[!] Aggro policy will be deployed - cmd.exe, rundll32.exe, wmiprvse.exe will be blocked!" -ForegroundColor Red
+    } else {
+        Write-Host "[*] Skipping aggro policy" -ForegroundColor Yellow
     }
 
     $deployed = 0
@@ -1150,11 +1203,17 @@ function Refresh-WDAC {
         Write-Host "[+] Converting $fileName (ID: $policyId) -> $cipPath" -ForegroundColor Cyan
         ConvertFrom-CIPolicy -XmlFilePath $policyXml -BinaryFilePath $cipPath | Out-Null
 
-        & $citool --update-policy $cipPath
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[!] citool --update-policy failed for $fileName (exit $LASTEXITCODE)" -ForegroundColor Red
+        if ($hasCitool) {
+            & $citool --update-policy $cipPath
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[!] citool --update-policy failed for $fileName (exit $LASTEXITCODE)" -ForegroundColor Red
+            } else {
+                Write-Host "[+] Deployed $fileName" -ForegroundColor Green
+                $deployed++
+            }
         } else {
-            Write-Host "[+] Deployed $fileName" -ForegroundColor Green
+            # .cip file is already in the Active dir, just count it
+            Write-Host "[+] Placed $fileName in CiPolicies\Active" -ForegroundColor Green
             $deployed++
         }
     }
@@ -1164,12 +1223,24 @@ function Refresh-WDAC {
         return
     }
 
+    # Refresh policies
     Write-Host "[+] Refreshing all policies..." -ForegroundColor Cyan
-    & $citool --refresh
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[+] All $deployed policies refreshed successfully" -ForegroundColor Green
+    if ($hasCitool) {
+        & $citool --refresh
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[+] All $deployed policies refreshed successfully" -ForegroundColor Green
+        } else {
+            Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
+        }
+    } elseif ($hasRefreshExe) {
+        & $refreshPolicy
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[+] All $deployed policies refreshed via RefreshPolicy.exe" -ForegroundColor Green
+        } else {
+            Write-Host "[!] RefreshPolicy.exe exited with code $LASTEXITCODE" -ForegroundColor Red
+        }
     } else {
-        Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
+        Write-Host "[!] No refresh tool available - REBOOT required to load policies" -ForegroundColor Yellow
     }
 
     Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
@@ -1375,7 +1446,7 @@ function Apply-SecurityBaseline {
     Write-Host "`n[+] Running gpupdate /force..." -ForegroundColor Cyan
     gpupdate /force
 
-    Write-Host "[+] Security Baseline applied to '$ddpName'" -ForegroundColor Green
+    Write-Host "[+] Security Baseline GPOs applied and linked to domain root" -ForegroundColor Green
     Write-Host "[!] Clients will pick up changes at next gpupdate interval or reboot" -ForegroundColor Yellow
 }
 
