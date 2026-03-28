@@ -588,11 +588,9 @@ function Enumerate {
         }
     })
 
-    # Get process details
-    Get-CimInstance Win32_Process | ForEach-Object {
+    # Get process details (no WMI - uses Get-Process -IncludeUserName)
+    Get-Process -IncludeUserName -ErrorAction SilentlyContinue | ForEach-Object {
         $proc = $_
-        $owner = $proc | Invoke-CimMethod -MethodName GetOwner
-        $commandLine = $proc.CommandLine
         $sessionId = $proc.SessionId
 
         # Match session ID to session name
@@ -600,9 +598,10 @@ function Enumerate {
         if (-not $sessionName) { $sessionName = "Unknown" }
 
         [PSCustomObject]@{
-            UserName    = "$($owner.Domain)\$($owner.User)"
-            ProcessID   = $proc.ProcessId
-            CommandLine = $commandLine
+            UserName    = $proc.UserName
+            ProcessID   = $proc.Id
+            ProcessName = $proc.ProcessName
+            Path        = $proc.Path
             SessionName = $sessionName
             SessionId   = $sessionId
         }
@@ -610,7 +609,7 @@ function Enumerate {
     Write-Output "==========END PROCESSES=========="
 
     Write-Output "==========START SERVICES=========="
-    $svc = Get-CimInstance Win32_Service | Select-Object Name, PathName
+    $svc = Get-Service | Select-Object Name, @{N='PathName';E={(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)" -ErrorAction SilentlyContinue).ImagePath}}
     Write-Output $svc
     Write-Output "==========END SERVICES=========="
 
@@ -694,18 +693,18 @@ function Guest-Service {
     # Prompt for password input for the Guest account
     $password = Read-Host -AsSecureString "Enter the password for the $username account"
 
-    # Convert the secure password to plain text for CIM interaction
+    # Convert the secure password to plain text for sc.exe
     $passwordPlainText = [System.Net.NetworkCredential]::new('', $password).Password
 
     # Prompt for the service name
     $serviceName = Read-Host "Enter the service name to manage"
 
-    # Use CIM to get the service object
-    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name = '$serviceName'"
+    # Check if service exists (no WMI)
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 
     if ($service) {
-        # Change the service credentials using CIM
-        Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ StartName = $username; StartPassword = $passwordPlainText } > $null
+        # Change the service credentials using sc.exe (no WMI needed)
+        sc.exe config $serviceName obj= $username password= $passwordPlainText > $null
 
         # Restart the service
         Restart-Service -Name $serviceName -Force # this will fail if u put random creds and its ok
@@ -836,8 +835,8 @@ function Phase2 {
         Write-Host "[+] Local lockout policy set: 3 attempts, 15-min lockout, 15-min reset" -ForegroundColor Green
 
         # On DCs, also set via AD to make it domain-wide and GPO-persistent
-        $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-        if ($domainRole -ge 4) {
+        $productType = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType
+        if ($productType -eq "LanmanNT") {
             try {
                 Import-Module ActiveDirectory -ErrorAction Stop
                 Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain) `
@@ -1078,8 +1077,7 @@ function Generate-WDAC {
     # =========================================================
     # DC-only: Configure WDAC block notification message via GPO
     # =========================================================
-    $domainRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
-    $isDC = $domainRole -eq 4 -or $domainRole -eq 5
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if ($isDC) {
         Write-Host "`n[+] Domain Controller detected - configuring WDAC block message in Default Domain Policy..." -ForegroundColor Cyan
@@ -1125,7 +1123,12 @@ function Refresh-WDAC {
     }
 
     $citool = "$env:windir\System32\citool.exe"
-    $useCitool = Test-Path $citool
+    if (-not (Test-Path $citool)) {
+        Write-Host "[!] citool.exe not found - cannot deploy policies" -ForegroundColor Red
+        Write-Host "[!] citool is required (Windows 11 / Server 2022+). WMI fallback removed to support aggro policy." -ForegroundColor Yellow
+        return
+    }
+
     $deployed = 0
 
     foreach ($fileName in $policyFiles) {
@@ -1147,17 +1150,11 @@ function Refresh-WDAC {
         Write-Host "[+] Converting $fileName (ID: $policyId) -> $cipPath" -ForegroundColor Cyan
         ConvertFrom-CIPolicy -XmlFilePath $policyXml -BinaryFilePath $cipPath | Out-Null
 
-        if ($useCitool) {
-            & $citool --update-policy $cipPath
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "[!] citool --update-policy failed for $fileName (exit $LASTEXITCODE)" -ForegroundColor Red
-            } else {
-                Write-Host "[+] Deployed $fileName" -ForegroundColor Green
-                $deployed++
-            }
+        & $citool --update-policy $cipPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[!] citool --update-policy failed for $fileName (exit $LASTEXITCODE)" -ForegroundColor Red
         } else {
-            Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = $cipPath}
-            Write-Host "[+] Deployed $fileName (via CimMethod)" -ForegroundColor Green
+            Write-Host "[+] Deployed $fileName" -ForegroundColor Green
             $deployed++
         }
     }
@@ -1167,14 +1164,12 @@ function Refresh-WDAC {
         return
     }
 
-    if ($useCitool) {
-        Write-Host "[+] Refreshing all policies..." -ForegroundColor Cyan
-        & $citool --refresh
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[+] All $deployed policies refreshed successfully" -ForegroundColor Green
-        } else {
-            Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
-        }
+    Write-Host "[+] Refreshing all policies..." -ForegroundColor Cyan
+    & $citool --refresh
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[+] All $deployed policies refreshed successfully" -ForegroundColor Green
+    } else {
+        Write-Host "[!] citool --refresh exited with code $LASTEXITCODE" -ForegroundColor Red
     }
 
     Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
@@ -1207,11 +1202,10 @@ Function Add-UsersToGroup {
 
 function Apply-SecurityBaseline {
     # Requires the GroupPolicy module (available on DCs and RSAT-installed machines)
-    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-    $isDC = $domainRole -ge 4
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if (-not $isDC) {
-        Write-Host "[!] This machine is not a Domain Controller (DomainRole=$domainRole)" -ForegroundColor Red
+        Write-Host "[!] This machine is not a Domain Controller" -ForegroundColor Red
         Write-Host "[!] Security Baseline GPO import requires a DC. Exiting." -ForegroundColor Red
         return
     }
@@ -1446,9 +1440,8 @@ function win-ccdc {
     # ========================
     # Step 3: DC-only tasks
     # ========================
-    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-    # DomainRole 4 = Backup DC, 5 = Primary DC
-    $isDC = $domainRole -ge 4
+    # ProductType "LanmanNT" = Domain Controller (no WMI needed)
+    $isDC = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions").ProductType -eq "LanmanNT"
 
     if ($isDC) {
         Write-Host "`n============================================" -ForegroundColor Magenta
@@ -1490,7 +1483,7 @@ function win-ccdc {
             Write-Host "[!] Certify.exe not found at $certifyExe" -ForegroundColor Red
         }
     } else {
-        Write-Host "`n[*] Not a Domain Controller (DomainRole=$domainRole) - skipping DC-only tasks" -ForegroundColor Yellow
+        Write-Host "`n[*] Not a Domain Controller - skipping DC-only tasks" -ForegroundColor Yellow
     }
 
     # ========================
